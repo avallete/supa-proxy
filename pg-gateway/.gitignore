@@ -1,1 +1,11 @@
 node_modules/
+
+# Compiled binary
+pg-gateway
+
+# Demo binary
+demo/pg-gateway
+
+# Test coverage
+coverage.out
+coverage.html

@@ -1,9 +1,11 @@
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /src
-COPY go.mod go.sum* ./
+COPY pg-gateway/go.mod pg-gateway/go.sum* ./pg-gateway/
+COPY multigres/ ./multigres/
+WORKDIR /src/pg-gateway
 RUN go mod download 2>/dev/null || true
-COPY . .
+COPY pg-gateway/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /pg-gateway .
 
 FROM scratch

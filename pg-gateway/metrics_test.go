@@ -60,7 +60,7 @@ func TestMetrics_SQLSuccess(t *testing.T) {
 
 	// Wrap handleSQL with the instrumented middleware like main.go does
 	ts := httptest.NewServer(instrumentedHandler("/sql", func(w http.ResponseWriter, r *http.Request) {
-		handleSQL(w, r, cfg)
+		handleSQL(w, r, cfg, nil)
 	}))
 	defer ts.Close()
 
@@ -90,7 +90,7 @@ func TestMetrics_AuthFailure(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/sql", strings.NewReader(`{"query":"SELECT 1"}`))
 	r.Header.Set("Authorization", "Bearer bad.token")
 	w := httptest.NewRecorder()
-	handleSQL(w, r, cfg)
+	handleSQL(w, r, cfg, nil)
 
 	after := gatherMetric(t, "pgw_auth_failures_total", map[string]string{"reason": "invalid_token"})
 	assert.Greater(t, after, before, "auth failure counter should have increased")

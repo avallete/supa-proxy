@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pg-gateway
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: pg-gateway/go.mod
+
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          working-directory: pg-gateway
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pg-gateway
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: pg-gateway/go.mod
+
+      - name: Run unit tests
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: pg-gateway/coverage.out
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pg-gateway
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: pg-gateway/go.mod
+
+      - name: Run integration tests
+        run: go test -tags integration -v -race -timeout 5m ./...
+
+  e2e-tests:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: pg-gateway/go.mod
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Build pg-gateway
+        working-directory: pg-gateway
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o pg-gateway .
+
+      - name: Install E2E dependencies
+        working-directory: pg-gateway/e2e
+        run: bun install
+
+      - name: Run E2E tests
+        working-directory: pg-gateway/e2e
+        run: bun test --timeout 120000

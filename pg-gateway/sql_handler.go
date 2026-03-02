@@ -58,7 +58,7 @@ type errorInfo struct {
 
 // --- Handler ---
 
-func handleSQL(w http.ResponseWriter, r *http.Request, cfg *Config) {
+func handleSQL(w http.ResponseWriter, r *http.Request, cfg *Config, pm *poolManager) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, errorMsg{Error: errorInfo{Message: "method not allowed"}})
 		return
@@ -153,7 +153,15 @@ func handleSQL(w http.ResponseWriter, r *http.Request, cfg *Config) {
 		maxFieldBytes = *req.MaxFieldBytes
 	}
 
-	if err := executeStreaming(ctx, connCfg, &req, claims, cfg, readonly, maxFieldBytes, start, writeLine); err != nil {
+	// Cross-region warning
+	if cfg.Region != "" && claims.Host != "" && claims.Host != cfg.PGHost {
+		slog.WarnContext(ctx, "cross-region query",
+			"proxy_region", cfg.Region,
+			"target_host", claims.Host,
+		)
+	}
+
+	if err := executeStreaming(ctx, connCfg, &req, claims, cfg, pm, host, port, db, readonly, maxFieldBytes, start, writeLine); err != nil {
 		// Headers already sent; append an error line.
 		writeLine(errorMsg{Error: errorInfo{Message: err.Error()}})
 	}
@@ -211,17 +219,22 @@ func executeStreaming(
 	req *sqlRequest,
 	claims *JWTClaims,
 	cfg *Config,
+	pm *poolManager,
+	host string,
+	port int,
+	db string,
 	readonly bool,
 	maxFieldBytes int,
 	start time.Time,
 	writeLine func(interface{}) error,
 ) error {
-	conn, err := pgx.ConnectConfig(ctx, connCfg)
+	// Acquire a connection: pooled or direct.
+	conn, release, err := acquireConn(ctx, connCfg, pm, host, port, db)
 	if err != nil {
 		dbErrorsTotal.WithLabelValues("connection").Inc()
 		return fmt.Errorf("connection failed: %w", err)
 	}
-	defer conn.Close(ctx)
+	defer release()
 
 	// Apply session settings
 	if err := applySession(ctx, conn, claims, cfg, readonly); err != nil {
@@ -238,6 +251,29 @@ func executeStreaming(
 	default:
 		return execDML(ctx, conn, req.Query, start, writeLine)
 	}
+}
+
+// acquireConn gets a *pgx.Conn either from the pool or via direct connection.
+// Returns the connection and a release function that must be called when done.
+func acquireConn(ctx context.Context, connCfg *pgx.ConnConfig, pm *poolManager, host string, port int, db string) (*pgx.Conn, func(), error) {
+	if pm != nil {
+		pool, err := pm.getPool(ctx, host, port, db)
+		if err != nil {
+			return nil, nil, err
+		}
+		poolConn, err := pool.Acquire(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return poolConn.Conn(), func() { poolConn.Release() }, nil
+	}
+
+	// Direct connection (pooling disabled)
+	conn, err := pgx.ConnectConfig(ctx, connCfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, func() { conn.Close(ctx) }, nil
 }
 
 func applySession(ctx context.Context, conn *pgx.Conn, claims *JWTClaims, cfg *Config, readonly bool) error {

@@ -106,7 +106,12 @@ Key behaviors:
 ### `GET /health`
 
 ```json
-{"status":"ok","version":"0.1.0","pg_version":"16.4"}
+{"status":"ok","version":"0.1.0"}
+```
+
+When `REGION` is set:
+```json
+{"status":"ok","version":"0.1.0","region":"ap-southeast-1"}
 ```
 
 ## Configuration (env vars)
@@ -128,14 +133,73 @@ Key behaviors:
 | `CURSOR_BATCH_SIZE` | `100` | Rows per FETCH batch |
 | `ALLOWED_ORIGINS` | `*` | CORS origins |
 | `LOG_QUERIES` | `false` | Log SQL to stdout |
+| `LOG_TRAFFIC` | `false` | Log raw wire protocol traffic |
 | `METRICS_PORT` | `:2112` | Prometheus metrics |
+| `REGION` | | Region identifier (e.g. `ap-southeast-1`), included in `/health` |
+| `POOL_ENABLED` | `false` | Enable connection pooling for `/sql` |
+| `POOL_MAX_CONNS` | `20` | Max connections per target database |
+| `POOL_MIN_CONNS` | `2` | Min idle connections per target database |
+| `POOL_MAX_CONN_LIFETIME` | `30m` | Max lifetime of a pooled connection |
+| `POOL_MAX_CONN_IDLE_TIME` | `5m` | Max idle time before a connection is closed |
+
+## Connection Pooling
+
+Enable with `POOL_ENABLED=true`. Only the `/sql` endpoint uses pooled connections;
+`/v1` (WebSocket relay) always opens a raw TCP passthrough.
+
+- **Per-target pools**: each unique `host:port/db` gets its own `pgxpool.Pool`
+- **Session reset**: `DISCARD ALL` runs on every connection release (resets ROLE, GUCs, temp tables, prepared statements, LISTEN channels)
+- **Idle eviction**: pools unused for 10 minutes are automatically closed (checked every 1 minute)
+- **Lazy creation**: pools are created on first request, with double-checked locking
 
 ## Build
 
 ```bash
+# Direct
 go build -o pg-gateway .
-# produces a single static binary, ~15MB
+
+# Via Makefile (stripped binary)
+make build
 ```
+
+## Testing
+
+```bash
+# Unit tests (no Docker required)
+make test
+
+# Integration tests (requires Docker — uses testcontainers)
+make test-integration
+
+# Bun E2E suite (requires Docker + Bun)
+make test-e2e
+
+# Stress tests (~5-10 min, manual only)
+make test-stress
+
+# Benchmarks
+make bench
+```
+
+## Prometheus Metrics
+
+All metrics are exposed on `METRICS_PORT` (default `:2112`) at `GET /metrics`.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pgw_http_request_duration_seconds` | Histogram | `path`, `status` | HTTP request duration |
+| `pgw_http_requests_total` | Counter | `path`, `status` | Total HTTP requests |
+| `pgw_active_connections` | Gauge | `type` | Currently active connections |
+| `pgw_query_duration_seconds` | Histogram | `command`, `status` | Query execution duration |
+| `pgw_rows_processed_total` | Counter | `command` | Total rows processed |
+| `pgw_truncated_fields_total` | Counter | — | Fields truncated by `MAX_FIELD_BYTES` |
+| `pgw_relay_bytes_total` | Counter | `direction` | Bytes relayed (WS) |
+| `pgw_relay_duration_seconds` | Histogram | — | WebSocket relay session duration |
+| `pgw_auth_failures_total` | Counter | `reason` | Authentication failures |
+| `pgw_db_errors_total` | Counter | `error_type` | Database errors |
+| `pgw_pool_acquired_conns` | Gauge | `target` | Acquired connections from pool |
+| `pgw_pool_idle_conns` | Gauge | `target` | Idle connections in pool |
+| `pgw_pool_total_conns` | Gauge | `target` | Total connections in pool |
 
 ## Multi-tenant scaling
 

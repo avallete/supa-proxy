@@ -6,8 +6,8 @@
 services:
   postgres-gateway:
     build:
-      context: .
-      dockerfile: Dockerfile.postgres
+      context: ..
+      dockerfile: pg-gateway/Dockerfile.postgres
     ports:
       - "5432:5432"
       - "15432:15432"

@@ -25,15 +25,30 @@ func main() {
 	slog.Info("pg-gateway starting",
 		"listen", cfg.ListenPort,
 		"metrics", cfg.MetricsPort,
+		"region", cfg.Region,
 		"pg_target", fmt.Sprintf("%s:%d", cfg.PGHost, cfg.PGPort),
 		"db", cfg.PGDatabase,
 		"max_field_bytes", cfg.MaxFieldBytes,
 		"cursor_batch", cfg.CursorBatchSize,
 		"statement_timeout", cfg.StatementTimeout.String(),
+		"pool_enabled", cfg.PoolEnabled,
 	)
 
 	if cfg.JWTSecret == "" {
 		slog.Warn("JWT_SECRET not set — all authenticated endpoints will reject requests")
+	}
+
+	// --- Connection pool ---
+	var pm *poolManager
+	if cfg.PoolEnabled {
+		pm = newPoolManager(cfg)
+		defer pm.Close()
+		slog.Info("connection pooling enabled",
+			"max_conns_per_target", cfg.PoolMaxConns,
+			"min_conns_per_target", cfg.PoolMinConns,
+			"max_conn_lifetime", cfg.PoolMaxConnLifetime.String(),
+			"max_conn_idle_time", cfg.PoolMaxConnIdleTime.String(),
+		)
 	}
 
 	// --- HTTP mux ---
@@ -42,8 +57,11 @@ func main() {
 	// Liveness probe (no auth)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		addCORS(w, r, cfg)
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","version":"0.1.0"}`)
+		resp := map[string]string{"status": "ok", "version": "0.1.0"}
+		if cfg.Region != "" {
+			resp["region"] = cfg.Region
+		}
+		writeJSON(w, http.StatusOK, resp)
 	})
 
 	// Readiness probe — verifies PG connectivity (no auth)
@@ -91,13 +109,27 @@ func main() {
 		// POST /sql — NDJSON streaming query endpoint
 		if r.URL.Path == "/sql" {
 			instrumentedHandler("/sql", func(w http.ResponseWriter, r *http.Request) {
-				handleSQL(w, r, cfg)
+				handleSQL(w, r, cfg, pm)
 			})(w, r)
 			return
 		}
 
 		http.NotFound(w, r)
 	})
+
+	// --- Pool metrics collector ---
+	if pm != nil {
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					updatePoolMetrics(pm)
+				}
+			}
+		}()
+	}
 
 	// --- Metrics server (separate port, like wsproxy) ---
 	go func() {
@@ -156,6 +188,16 @@ func loadConfig() *Config {
 	cfg.AllowedOrigins = envOr("ALLOWED_ORIGINS", "*")
 	cfg.LogQueries = envOr("LOG_QUERIES", "false") == "true"
 	cfg.LogTraffic = envOr("LOG_TRAFFIC", "false") == "true"
+
+	// Region
+	cfg.Region = envOr("REGION", "")
+
+	// Connection pooling
+	cfg.PoolEnabled = envOr("POOL_ENABLED", "false") == "true"
+	cfg.PoolMaxConns = envInt("POOL_MAX_CONNS", 20)
+	cfg.PoolMinConns = envInt("POOL_MIN_CONNS", 2)
+	cfg.PoolMaxConnLifetime = envDuration("POOL_MAX_CONN_LIFETIME", "30m")
+	cfg.PoolMaxConnIdleTime = envDuration("POOL_MAX_CONN_IDLE_TIME", "5m")
 
 	return cfg
 }

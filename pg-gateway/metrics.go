@@ -65,6 +65,21 @@ var (
 		Name: "pgw_db_errors_total",
 		Help: "Total number of database errors.",
 	}, []string{"error_type"})
+
+	poolAcquiredConns = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "pgw_pool_acquired_conns",
+		Help: "Number of currently acquired connections from pool.",
+	}, []string{"target"})
+
+	poolIdleConns = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "pgw_pool_idle_conns",
+		Help: "Number of idle connections in pool.",
+	}, []string{"target"})
+
+	poolTotalConns = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "pgw_pool_total_conns",
+		Help: "Total number of connections in pool.",
+	}, []string{"target"})
 )
 
 // statusResponseWriter wraps http.ResponseWriter to capture the status code.
@@ -95,6 +110,15 @@ func (w *statusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (w *statusResponseWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
+	}
+}
+
+// updatePoolMetrics updates pool gauge metrics from the poolManager snapshot.
+func updatePoolMetrics(pm *poolManager) {
+	for target, stat := range pm.stats() {
+		poolAcquiredConns.WithLabelValues(target).Set(float64(stat.AcquiredConns()))
+		poolIdleConns.WithLabelValues(target).Set(float64(stat.IdleConns()))
+		poolTotalConns.WithLabelValues(target).Set(float64(stat.TotalConns()))
 	}
 }
 

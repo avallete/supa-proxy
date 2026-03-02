@@ -27,7 +27,7 @@ func postSQLBody(t *testing.T, cfg *Config, body string) []map[string]json.RawMe
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
-	handleSQL(w, r, cfg)
+	handleSQL(w, r, cfg, nil)
 
 	var lines []map[string]json.RawMessage
 	scanner := bufio.NewScanner(w.Body)

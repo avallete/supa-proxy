@@ -127,7 +127,7 @@ func TestSQL_MissingAuth(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/sql", nil)
 	w := httptest.NewRecorder()
 
-	handleSQL(w, r, cfg)
+	handleSQL(w, r, cfg, nil)
 
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
@@ -139,7 +139,7 @@ func TestSQL_InvalidToken(t *testing.T) {
 	r.Header.Set("Authorization", "Bearer not.a.real.token")
 	w := httptest.NewRecorder()
 
-	handleSQL(w, r, cfg)
+	handleSQL(w, r, cfg, nil)
 
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
@@ -152,7 +152,7 @@ func TestSQL_ExpiredToken(t *testing.T) {
 	r.Header.Set("Authorization", "Bearer "+token)
 	w := httptest.NewRecorder()
 
-	handleSQL(w, r, cfg)
+	handleSQL(w, r, cfg, nil)
 
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }

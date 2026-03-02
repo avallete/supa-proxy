@@ -1,17 +1,19 @@
 # Dockerfile.postgres — postgres:16 bundled with pg-gateway.
 # Swap FROM to supabase/postgres:15.1.1.78 (or whichever tag) for prod.
 #
-# Build:   docker build -f Dockerfile.postgres -t pg-gateway-postgres .
+# Build:   docker build -f pg-gateway/Dockerfile.postgres -t pg-gateway-postgres .
 # Run:     docker run -e POSTGRES_PASSWORD=secret -e JWT_SECRET=dev-secret -p 5432:5432 -p 15432:15432 pg-gateway-postgres
 
 # ── Stage 1: build pg-gateway binary ─────────────────────────────────────────
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /src
-COPY go.mod go.sum ./
+COPY pg-gateway/go.mod pg-gateway/go.sum* ./pg-gateway/
+COPY multigres/ ./multigres/
+WORKDIR /src/pg-gateway
 RUN go mod download
 
-COPY *.go ./
+COPY pg-gateway/*.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /pg-gateway .
 
 # ── Stage 2: final image ──────────────────────────────────────────────────────
@@ -19,7 +21,7 @@ FROM postgres:16
 
 # Copy binary and entrypoint
 COPY --from=builder /pg-gateway /usr/local/bin/pg-gateway
-COPY entrypoint.sh /usr/local/bin/pg-gateway-entrypoint.sh
+COPY pg-gateway/entrypoint.sh /usr/local/bin/pg-gateway-entrypoint.sh
 RUN chmod +x /usr/local/bin/pg-gateway-entrypoint.sh
 
 # pg-gateway defaults (all overridable at runtime)

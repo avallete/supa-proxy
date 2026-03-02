@@ -26,7 +26,7 @@ func BenchmarkSQLHandler_10Rows(b *testing.B) {
 		r.Header.Set("Authorization", "Bearer "+token)
 		r.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
-		handleSQL(w, r, cfg)
+		handleSQL(w, r, cfg, nil)
 		if w.Code != http.StatusOK {
 			b.Fatalf("unexpected status %d", w.Code)
 		}
@@ -46,7 +46,7 @@ func BenchmarkSQLHandler_1000Rows(b *testing.B) {
 		r.Header.Set("Authorization", "Bearer "+token)
 		r.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
-		handleSQL(w, r, cfg)
+		handleSQL(w, r, cfg, nil)
 	}
 }
 
@@ -64,7 +64,7 @@ func BenchmarkSQLHandler_LargeField(b *testing.B) {
 		r.Header.Set("Authorization", "Bearer "+token)
 		r.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
-		handleSQL(w, r, cfg)
+		handleSQL(w, r, cfg, nil)
 	}
 }
 
@@ -81,7 +81,7 @@ func BenchmarkSQLHandler_10000Rows(b *testing.B) {
 		r.Header.Set("Authorization", "Bearer "+token)
 		r.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
-		handleSQL(w, r, cfg)
+		handleSQL(w, r, cfg, nil)
 		if w.Code != http.StatusOK {
 			b.Fatalf("unexpected status %d", w.Code)
 		}
@@ -102,7 +102,7 @@ func BenchmarkSQLHandler_1000Rows_LargeColumns(b *testing.B) {
 		r.Header.Set("Authorization", "Bearer "+token)
 		r.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
-		handleSQL(w, r, cfg)
+		handleSQL(w, r, cfg, nil)
 		if w.Code != http.StatusOK {
 			b.Fatalf("unexpected status %d", w.Code)
 		}

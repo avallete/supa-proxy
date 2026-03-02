@@ -92,7 +92,7 @@ func postSQL(t *testing.T, cfg *Config, query string) []map[string]json.RawMessa
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
-	handleSQL(w, r, cfg)
+	handleSQL(w, r, cfg, nil)
 
 	var lines []map[string]json.RawMessage
 	scanner := bufio.NewScanner(w.Body)
@@ -295,7 +295,7 @@ func TestSQL_ReadOnly(t *testing.T) {
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
-	handleSQL(w, r, cfg)
+	handleSQL(w, r, cfg, nil)
 
 	scanner := bufio.NewScanner(w.Body)
 	var lastLine map[string]json.RawMessage
