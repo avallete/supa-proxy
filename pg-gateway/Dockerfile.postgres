@@ -1,0 +1,38 @@
+# Dockerfile.postgres — postgres:16 bundled with pg-gateway.
+# Swap FROM to supabase/postgres:15.1.1.78 (or whichever tag) for prod.
+#
+# Build:   docker build -f Dockerfile.postgres -t pg-gateway-postgres .
+# Run:     docker run -e POSTGRES_PASSWORD=secret -e JWT_SECRET=dev-secret -p 5432:5432 -p 15432:15432 pg-gateway-postgres
+
+# ── Stage 1: build pg-gateway binary ─────────────────────────────────────────
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY *.go ./
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /pg-gateway .
+
+# ── Stage 2: final image ──────────────────────────────────────────────────────
+FROM postgres:16
+
+# Copy binary and entrypoint
+COPY --from=builder /pg-gateway /usr/local/bin/pg-gateway
+COPY entrypoint.sh /usr/local/bin/pg-gateway-entrypoint.sh
+RUN chmod +x /usr/local/bin/pg-gateway-entrypoint.sh
+
+# pg-gateway defaults (all overridable at runtime)
+ENV LISTEN_PORT=":15432"
+ENV METRICS_PORT=":2112"
+ENV PG_HOST="127.0.0.1"
+ENV ALLOW_ADDR_REGEX="^127\\.0\\.0\\.1:5432$"
+ENV STATEMENT_TIMEOUT="30s"
+ENV MAX_FIELD_BYTES="1048576"
+ENV CURSOR_BATCH_SIZE="100"
+ENV MAX_ROWS="0"
+ENV LOG_QUERIES="false"
+
+EXPOSE 5432 15432 2112
+
+ENTRYPOINT ["/usr/local/bin/pg-gateway-entrypoint.sh"]

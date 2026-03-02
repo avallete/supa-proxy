@@ -1,0 +1,25 @@
+# Single-container variant: Postgres + pg-gateway in one image.
+# Mirrors the deployment model for self-hosted AMIs.
+#
+# Usage:
+#   docker compose -f docker-compose.combined.yml up --build
+services:
+  postgres-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
+    ports:
+      - "5432:5432"
+      - "15432:15432"
+      - "2112:2112"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      JWT_SECRET: "dev-secret-change-me"
+      LOG_QUERIES: "true"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

@@ -1,0 +1,3 @@
+[submodule "multigres"]
+	path = multigres
+	url = https://github.com/multigres/multigres.git
