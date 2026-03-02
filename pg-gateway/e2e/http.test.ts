@@ -335,6 +335,122 @@ describe("SELECT", () => {
   });
 });
 
+// ── Special characters in content (7) ────────────────────────────────────────
+
+describe("Special characters in content", () => {
+  beforeAll(async () => {
+    await sql(
+      infra.baseUrl,
+      "CREATE TABLE IF NOT EXISTS http_test_special (id SERIAL PRIMARY KEY, val TEXT)",
+      infra.token,
+    );
+  });
+
+  afterAll(async () => {
+    await sql(
+      infra.baseUrl,
+      "DROP TABLE IF EXISTS http_test_special",
+      infra.token,
+    );
+  });
+
+  it("LF in text → newlines preserved, NDJSON parsing not broken", async () => {
+    const lines = await sql(
+      infra.baseUrl,
+      "SELECT E'line1\\nline2\\nline3' AS val",
+      infra.token,
+    );
+    const rows = getRows(lines);
+    expect(rows[0]).toEqual({ val: "line1\nline2\nline3" });
+    expect(getComplete(lines)).toBeDefined();
+  });
+
+  it("CRLF in text → Windows line endings preserved", async () => {
+    const lines = await sql(
+      infra.baseUrl,
+      "SELECT E'line1\\r\\nline2' AS val",
+      infra.token,
+    );
+    const rows = getRows(lines);
+    expect(rows[0]).toEqual({ val: "line1\r\nline2" });
+    expect(getComplete(lines)).toBeDefined();
+  });
+
+  it("CR alone in text → carriage return preserved", async () => {
+    const lines = await sql(
+      infra.baseUrl,
+      "SELECT E'before\\rafter' AS val",
+      infra.token,
+    );
+    const rows = getRows(lines);
+    expect(rows[0]).toEqual({ val: "before\rafter" });
+    expect(getComplete(lines)).toBeDefined();
+  });
+
+  it("Tab in text → tab character preserved", async () => {
+    const lines = await sql(
+      infra.baseUrl,
+      "SELECT E'col1\\tcol2' AS val",
+      infra.token,
+    );
+    const rows = getRows(lines);
+    expect(rows[0]).toEqual({ val: "col1\tcol2" });
+    expect(getComplete(lines)).toBeDefined();
+  });
+
+  it("Quotes and backslashes → JSON metacharacters preserved", async () => {
+    const lines = await sql(
+      infra.baseUrl,
+      "SELECT E'she said \"hello\" C:\\\\Users' AS val",
+      infra.token,
+    );
+    const rows = getRows(lines);
+    expect(rows[0]).toEqual({ val: 'she said "hello" C:\\Users' });
+    expect(getComplete(lines)).toBeDefined();
+  });
+
+  it("INSERT → SELECT round-trip → multi-line text preserved through PG storage", async () => {
+    await sql(
+      infra.baseUrl,
+      `INSERT INTO http_test_special (val) VALUES (E'line1\\nline2\\r\\nline3\\ttab\\r\\nquote"end')`,
+      infra.token,
+    );
+    const lines = await sql(
+      infra.baseUrl,
+      "SELECT val FROM http_test_special ORDER BY id DESC LIMIT 1",
+      infra.token,
+    );
+    const rows = getRows(lines);
+    expect(rows).toMatchInlineSnapshot(`
+      [
+        {
+          "val": 
+      "line1
+      line2
+      line3	tab
+      quote"end"
+      ,
+        },
+      ]
+    `);
+  });
+
+  it("Null byte → PG rejects with clean error, stream not broken", async () => {
+    const lines = await sql(
+      infra.baseUrl,
+      "SELECT E'before\\x00after' AS val",
+      infra.token,
+    );
+    const err = getError(lines);
+    expect(err).toMatchInlineSnapshot(`
+      {
+        "message": "ERROR: invalid byte sequence for encoding "UTF8": 0x00 (SQLSTATE 22021)",
+      }
+    `);
+    expect(getComplete(lines)).toBeUndefined();
+  });
+});
+
 // ── Transactions (2) ──────────────────────────────────────────────────────────
 
 describe("Transactions", () => {

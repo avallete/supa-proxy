@@ -14,6 +14,7 @@ import { GenericContainer, Wait } from "testcontainers";
 import type { StartedTestContainer } from "testcontainers";
 import { Pool, neonConfig } from "@neondatabase/serverless";
 import WS from "ws";
+import ndjsonStream from "ndjson-readablestream";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -275,28 +276,10 @@ export async function sql(
   token: string,
   extra?: Record<string, unknown>,
 ): Promise<NdjsonLine[]> {
-  const res = await fetch(`${baseUrl}/sql`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ query, ...extra }),
-  });
-
   const lines: NdjsonLine[] = [];
-  const reader = res.body!.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const parts = buf.split("\n");
-    buf = parts.pop()!;
-    for (const p of parts) if (p.trim()) lines.push(JSON.parse(p));
+  for await (const line of streamSQL(baseUrl, query, token, extra)) {
+    lines.push(line);
   }
-  if (buf.trim()) lines.push(JSON.parse(buf));
   return lines;
 }
 
@@ -319,29 +302,8 @@ export async function sqlRaw(
 
   const lines: NdjsonLine[] = [];
   if (res.body) {
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const parts = buf.split("\n");
-      buf = parts.pop()!;
-      for (const p of parts) {
-        try {
-          if (p.trim()) lines.push(JSON.parse(p));
-        } catch {
-          // ignore malformed lines on error responses
-        }
-      }
-    }
-    if (buf.trim()) {
-      try {
-        lines.push(JSON.parse(buf));
-      } catch {
-        // ignore
-      }
+    for await (const line of ndjsonStream<NdjsonLine>(res.body)) {
+      lines.push(line);
     }
   }
 
@@ -362,18 +324,7 @@ export async function* streamSQL(
     },
     body: JSON.stringify({ query, ...extra }),
   });
-  const reader = res.body!.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const parts = buf.split("\n");
-    buf = parts.pop()!;
-    for (const p of parts) if (p.trim()) yield JSON.parse(p);
-  }
-  if (buf.trim()) yield JSON.parse(buf);
+  yield* ndjsonStream<NdjsonLine>(res.body!);
 }
 
 export function getColumns(lines: NdjsonLine[]): ColumnInfo[] {
