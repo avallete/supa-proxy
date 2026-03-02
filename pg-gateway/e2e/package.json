@@ -1,0 +1,20 @@
+{
+  "name": "pg-gateway-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test --timeout 120000",
+    "test:stress": "bun test stress.test.ts --timeout 600000"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^0.10.4",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.14",
+    "bun-types": "latest",
+    "testcontainers": "^11.10.0",
+    "typescript": "^5.9.3"
+  }
+}
