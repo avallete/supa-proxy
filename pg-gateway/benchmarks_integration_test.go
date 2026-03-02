@@ -68,6 +68,47 @@ func BenchmarkSQLHandler_LargeField(b *testing.B) {
 	}
 }
 
+// BenchmarkSQLHandler_10000Rows benchmarks the full /sql handler with 10 000 rows (real PG).
+func BenchmarkSQLHandler_10000Rows(b *testing.B) {
+	connStr := startTestPG(b)
+	cfg := cfgFromConnStr(b, connStr, testSecret)
+	token := mintTestJWT(testSecret, "bench")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		body := `{"query":"SELECT i FROM generate_series(1,10000) i"}`
+		r := httptest.NewRequest(http.MethodPost, "/sql", strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer "+token)
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handleSQL(w, r, cfg)
+		if w.Code != http.StatusOK {
+			b.Fatalf("unexpected status %d", w.Code)
+		}
+	}
+}
+
+// BenchmarkSQLHandler_1000Rows_LargeColumns benchmarks 1 000 rows × 10 KB columns (≈10 MB/iter, no truncation).
+func BenchmarkSQLHandler_1000Rows_LargeColumns(b *testing.B) {
+	connStr := startTestPG(b)
+	cfg := cfgFromConnStr(b, connStr, testSecret)
+	cfg.MaxFieldBytes = 0 // no truncation
+	token := mintTestJWT(testSecret, "bench")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		body := `{"query":"SELECT i, repeat('x', 10240) AS data FROM generate_series(1,1000) i"}`
+		r := httptest.NewRequest(http.MethodPost, "/sql", strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer "+token)
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handleSQL(w, r, cfg)
+		if w.Code != http.StatusOK {
+			b.Fatalf("unexpected status %d", w.Code)
+		}
+	}
+}
+
 // BenchmarkWSRelay_Handshake benchmarks WS connect+close with a mock TCP server.
 func BenchmarkWSRelay_Handshake(b *testing.B) {
 	mockAddr, _ := startMockPGServer(b)

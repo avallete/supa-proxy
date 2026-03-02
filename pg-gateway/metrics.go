@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -65,6 +68,8 @@ var (
 )
 
 // statusResponseWriter wraps http.ResponseWriter to capture the status code.
+// It forwards http.Hijacker (required for WebSocket upgrades) and http.Flusher
+// (required for chunked streaming responses) from the underlying writer.
 type statusResponseWriter struct {
 	http.ResponseWriter
 	status int
@@ -73,6 +78,24 @@ type statusResponseWriter struct {
 func (w *statusResponseWriter) WriteHeader(status int) {
 	w.status = status
 	w.ResponseWriter.WriteHeader(status)
+}
+
+// Hijack implements http.Hijacker so that gorilla/websocket can upgrade the
+// connection. Without this, the WebSocket upgrade returns 500.
+func (w *statusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("underlying ResponseWriter does not implement http.Hijacker")
+	}
+	return h.Hijack()
+}
+
+// Flush implements http.Flusher so that chunked NDJSON responses are pushed to
+// the client as each row is written rather than buffered until the handler returns.
+func (w *statusResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // instrumentedHandler wraps an HTTP handler to record request duration and count.

@@ -18,9 +18,10 @@ import (
 // --- Request/Response types ---
 
 type sqlRequest struct {
-	Query    string `json:"query"`
-	DB       string `json:"db,omitempty"`
-	ReadOnly bool   `json:"readonly,omitempty"`
+	Query         string `json:"query"`
+	DB            string `json:"db,omitempty"`
+	ReadOnly      bool   `json:"readonly,omitempty"`
+	MaxFieldBytes *int   `json:"max_field_bytes,omitempty"` // nil → use cfg default
 }
 
 type columnMsg struct {
@@ -32,7 +33,8 @@ type columnInfo struct {
 }
 
 type rowMsg struct {
-	Row map[string]interface{} `json:"row"`
+	Row             map[string]interface{} `json:"row"`
+	TruncatedFields []string               `json:"truncated_fields,omitempty"`
 }
 
 type completeMsg struct {
@@ -146,7 +148,12 @@ func handleSQL(w http.ResponseWriter, r *http.Request, cfg *Config) {
 		slog.InfoContext(ctx, "sql query", "user", claimsSub(claims), "query", q)
 	}
 
-	if err := executeStreaming(ctx, connCfg, &req, claims, cfg, readonly, start, writeLine); err != nil {
+	maxFieldBytes := cfg.MaxFieldBytes
+	if req.MaxFieldBytes != nil {
+		maxFieldBytes = *req.MaxFieldBytes
+	}
+
+	if err := executeStreaming(ctx, connCfg, &req, claims, cfg, readonly, maxFieldBytes, start, writeLine); err != nil {
 		// Headers already sent; append an error line.
 		writeLine(errorMsg{Error: errorInfo{Message: err.Error()}})
 	}
@@ -205,6 +212,7 @@ func executeStreaming(
 	claims *JWTClaims,
 	cfg *Config,
 	readonly bool,
+	maxFieldBytes int,
 	start time.Time,
 	writeLine func(interface{}) error,
 ) error {
@@ -222,11 +230,11 @@ func executeStreaming(
 
 	switch classifyQuery(req.Query) {
 	case queryKindSelect:
-		return streamSelect(ctx, conn, req.Query, cfg, start, writeLine)
+		return streamSelect(ctx, conn, req.Query, cfg, maxFieldBytes, start, writeLine)
 	case queryKindDMLReturning:
 		// Bug 1 fix: DML with RETURNING must use conn.Query, not conn.Exec,
 		// otherwise returned rows are silently discarded.
-		return streamReturning(ctx, conn, req.Query, cfg, start, writeLine)
+		return streamReturning(ctx, conn, req.Query, cfg, maxFieldBytes, start, writeLine)
 	default:
 		return execDML(ctx, conn, req.Query, start, writeLine)
 	}
@@ -260,6 +268,7 @@ func streamSelect(
 	conn *pgx.Conn,
 	query string,
 	cfg *Config,
+	maxFieldBytes int,
 	start time.Time,
 	writeLine func(interface{}) error,
 ) error {
@@ -315,11 +324,16 @@ func streamSelect(
 
 			fds := rows.FieldDescriptions()
 			row := make(map[string]interface{}, len(fds))
+			var truncated []string
 			for i, fd := range fds {
-				row[fd.Name] = truncateValue(values[i], cfg.MaxFieldBytes)
+				val, wasTruncated := truncateValue(values[i], maxFieldBytes)
+				row[fd.Name] = val
+				if wasTruncated {
+					truncated = append(truncated, fd.Name)
+				}
 			}
 
-			if err := writeLine(rowMsg{Row: row}); err != nil {
+			if err := writeLine(rowMsg{Row: row, TruncatedFields: truncated}); err != nil {
 				rows.Close()
 				return err // client disconnected
 			}
@@ -367,6 +381,7 @@ func streamReturning(
 	conn *pgx.Conn,
 	query string,
 	cfg *Config,
+	maxFieldBytes int,
 	start time.Time,
 	writeLine func(interface{}) error,
 ) error {
@@ -396,11 +411,16 @@ func streamReturning(
 		}
 
 		row := make(map[string]interface{}, len(fds))
+		var truncated []string
 		for i, fd := range fds {
-			row[fd.Name] = truncateValue(values[i], cfg.MaxFieldBytes)
+			val, wasTruncated := truncateValue(values[i], maxFieldBytes)
+			row[fd.Name] = val
+			if wasTruncated {
+				truncated = append(truncated, fd.Name)
+			}
 		}
 
-		if err := writeLine(rowMsg{Row: row}); err != nil {
+		if err := writeLine(rowMsg{Row: row, TruncatedFields: truncated}); err != nil {
 			rows.Close()
 			return err
 		}
@@ -509,25 +529,26 @@ func isValidIdent(s string) bool {
 // truncateValue truncates large byte slices and strings to maxBytes.
 // Other types pass through unchanged. This is the key to bounded memory:
 // pgx already materialized the value, but we cap what we serialize to JSON.
-func truncateValue(v interface{}, maxBytes int) interface{} {
+// Returns the (possibly truncated) value and a bool indicating truncation occurred.
+func truncateValue(v interface{}, maxBytes int) (interface{}, bool) {
 	if maxBytes <= 0 {
-		return v // no limit
+		return v, false // no limit
 	}
 	switch val := v.(type) {
 	case []byte:
 		if len(val) > maxBytes {
 			truncatedFieldsTotal.Inc()
 			return fmt.Sprintf("[truncated: %d bytes, showing first %d]%s",
-				len(val), maxBytes, string(val[:maxBytes]))
+				len(val), maxBytes, string(val[:maxBytes])), true
 		}
 	case string:
 		if len(val) > maxBytes {
 			truncatedFieldsTotal.Inc()
 			return fmt.Sprintf("[truncated: %d bytes, showing first %d]%s",
-				len(val), maxBytes, val[:maxBytes])
+				len(val), maxBytes, val[:maxBytes]), true
 		}
 	}
-	return v
+	return v, false
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
