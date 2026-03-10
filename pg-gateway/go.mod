@@ -6,14 +6,12 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/jackc/pgx/v5 v5.8.0
-	github.com/multigres/multigres v0.0.0-00010101000000-000000000000
+	github.com/multigres/multigres v0.0.0-20260126223308-f5a52171bbc4
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.40.0
 )
-
-replace github.com/multigres/multigres => ../multigres
 
 require (
 	dario.cat/mergo v1.0.2 // indirect
