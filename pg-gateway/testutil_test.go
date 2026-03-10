@@ -48,6 +48,7 @@ func newTestConfig(pgHost string, pgPort int, secret string) *Config {
 		AllowAddrRegex:   ".*",
 		StatementTimeout: 30 * time.Second,
 		MaxFieldBytes:    1048576,
+		MaxMemory:        10485760,
 		CursorBatchSize:  100,
 		AllowedOrigins:   "*",
 	}

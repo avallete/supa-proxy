@@ -31,9 +31,10 @@ type Config struct {
 
 	// Query safety
 	StatementTimeout time.Duration `env:"STATEMENT_TIMEOUT" envDefault:"30s"`
-	MaxFieldBytes    int           `env:"MAX_FIELD_BYTES" envDefault:"1048576"` // 1MB
-	MaxRows          int           `env:"MAX_ROWS" envDefault:"0"`             // 0 = unlimited
+	MaxFieldBytes    int           `env:"MAX_FIELD_BYTES" envDefault:"1048576"`  // 1MB; 0 = unlimited (no truncation)
+	MaxRows          int           `env:"MAX_ROWS" envDefault:"0"`              // 0 = unlimited
 	CursorBatchSize  int           `env:"CURSOR_BATCH_SIZE" envDefault:"100"`
+	MaxMemory        int           `env:"MAX_MEMORY" envDefault:"10485760"`     // 10MB per-query memory budget; 0 = no budget
 
 	// Connection pooling (for /sql endpoint only)
 	PoolEnabled         bool          `env:"POOL_ENABLED" envDefault:"false"`

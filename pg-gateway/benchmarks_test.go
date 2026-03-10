@@ -23,21 +23,23 @@ func BenchmarkNDJSONSerialization(b *testing.B) {
 	}
 }
 
-// BenchmarkTruncateValue_SmallStr measures truncation for a string below the limit (common path).
-func BenchmarkTruncateValue_SmallStr(b *testing.B) {
-	s := strings.Repeat("x", 128)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		truncateValue(s, 1048576)
+// BenchmarkWriteJSONRow measures the cost of writing a NDJSON row from raw PG wire columns.
+func BenchmarkWriteJSONRow(b *testing.B) {
+	fields := []fieldDesc{
+		{Name: "id", DataTypeOID: oidInt4},
+		{Name: "name", DataTypeOID: 25},
+		{Name: "score", DataTypeOID: oidFloat8},
 	}
-}
-
-// BenchmarkTruncateValue_LargeStr measures truncation for a 10 MB string with a 1 MB limit.
-func BenchmarkTruncateValue_LargeStr(b *testing.B) {
-	s := strings.Repeat("y", 10*1024*1024)
+	columns := []wireColumn{
+		{Data: []byte("42"), OriginalLen: 2},
+		{Data: []byte("alice"), OriginalLen: 5},
+		{Data: []byte("3.14"), OriginalLen: 4},
+	}
+	var buf strings.Builder
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		truncateValue(s, 1024*1024)
+		buf.Reset()
+		writeJSONRow(&buf, fields, columns)
 	}
 }
 

@@ -76,6 +76,7 @@ func cfgFromConnStr(tb testing.TB, connStr, secret string) *Config {
 		PGDatabase:       c.Database,
 		StatementTimeout: 30 * 1e9, // 30s
 		MaxFieldBytes:    1048576,
+		MaxMemory:        10485760,
 		CursorBatchSize:  100,
 		AllowedOrigins:   "*",
 	}

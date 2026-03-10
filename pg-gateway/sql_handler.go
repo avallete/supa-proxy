@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,10 +19,14 @@ import (
 // --- Request/Response types ---
 
 type sqlRequest struct {
-	Query         string `json:"query"`
-	DB            string `json:"db,omitempty"`
-	ReadOnly      bool   `json:"readonly,omitempty"`
-	MaxFieldBytes *int   `json:"max_field_bytes,omitempty"` // nil → use cfg default
+	Query            string  `json:"query"`
+	DB               string  `json:"db,omitempty"`
+	ReadOnly         bool    `json:"readonly,omitempty"`
+	MaxFieldBytes    *int    `json:"max_field_bytes,omitempty"`
+	MaxRows          *int    `json:"max_rows,omitempty"`
+	StatementTimeout *string `json:"statement_timeout,omitempty"`
+	CursorBatchSize  *int    `json:"cursor_batch_size,omitempty"`
+	MaxMemory        *int    `json:"max_memory,omitempty"`
 }
 
 type columnMsg struct {
@@ -56,6 +61,79 @@ type errorInfo struct {
 	Hint    string `json:"hint,omitempty"`
 }
 
+// --- Per-query options ---
+
+type queryOptions struct {
+	MaxFieldBytes    int
+	MaxRows          int
+	StatementTimeout time.Duration
+	CursorBatchSize  int
+	MaxMemory        int
+}
+
+func resolveOptions(cfg *Config, req *sqlRequest) queryOptions {
+	opts := queryOptions{
+		MaxFieldBytes:    cfg.MaxFieldBytes,
+		MaxRows:          cfg.MaxRows,
+		StatementTimeout: cfg.StatementTimeout,
+		CursorBatchSize:  cfg.CursorBatchSize,
+		MaxMemory:        cfg.MaxMemory,
+	}
+	if opts.CursorBatchSize <= 0 {
+		opts.CursorBatchSize = 100
+	}
+	if req.MaxFieldBytes != nil {
+		opts.MaxFieldBytes = *req.MaxFieldBytes
+	}
+	if req.MaxRows != nil {
+		opts.MaxRows = *req.MaxRows
+	}
+	if req.StatementTimeout != nil {
+		if d, err := time.ParseDuration(*req.StatementTimeout); err == nil {
+			opts.StatementTimeout = d
+		}
+	}
+	if req.CursorBatchSize != nil && *req.CursorBatchSize > 0 {
+		opts.CursorBatchSize = *req.CursorBatchSize
+	}
+	if req.MaxMemory != nil {
+		opts.MaxMemory = *req.MaxMemory
+	}
+	return opts
+}
+
+// --- Stream writer ---
+
+type streamWriter struct {
+	w       http.ResponseWriter
+	flusher http.Flusher
+}
+
+func (sw *streamWriter) writeLine(v interface{}) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if _, err := sw.w.Write(data); err != nil {
+		return err
+	}
+	if sw.flusher != nil {
+		sw.flusher.Flush()
+	}
+	return nil
+}
+
+func (sw *streamWriter) writeRaw(data []byte) error {
+	if _, err := sw.w.Write(data); err != nil {
+		return err
+	}
+	if sw.flusher != nil {
+		sw.flusher.Flush()
+	}
+	return nil
+}
+
 // --- Handler ---
 
 func handleSQL(w http.ResponseWriter, r *http.Request, cfg *Config, pm *poolManager) {
@@ -86,6 +164,8 @@ func handleSQL(w http.ResponseWriter, r *http.Request, cfg *Config, pm *poolMana
 		return
 	}
 
+	opts := resolveOptions(cfg, &req)
+
 	// Resolve DB
 	db := cfg.PGDatabase
 	if req.DB != "" {
@@ -104,7 +184,6 @@ func handleSQL(w http.ResponseWriter, r *http.Request, cfg *Config, pm *poolMana
 		port = claims.Port
 	}
 
-	// Bug 4 fix: build ConnConfig directly to avoid URL encoding issues with passwords containing %.
 	connCfg, err := newPGConnConfig(cfg, host, port, db)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorMsg{Error: errorInfo{Message: err.Error()}})
@@ -121,21 +200,7 @@ func handleSQL(w http.ResponseWriter, r *http.Request, cfg *Config, pm *poolMana
 	w.WriteHeader(http.StatusOK)
 
 	flusher, _ := w.(http.Flusher)
-
-	writeLine := func(v interface{}) error {
-		data, err := json.Marshal(v)
-		if err != nil {
-			return err
-		}
-		data = append(data, '\n')
-		if _, err := w.Write(data); err != nil {
-			return err
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return nil
-	}
+	sw := &streamWriter{w: w, flusher: flusher}
 
 	ctx := withRequestID(r.Context(), r)
 	start := time.Now()
@@ -148,11 +213,6 @@ func handleSQL(w http.ResponseWriter, r *http.Request, cfg *Config, pm *poolMana
 		slog.InfoContext(ctx, "sql query", "user", claimsSub(claims), "query", q)
 	}
 
-	maxFieldBytes := cfg.MaxFieldBytes
-	if req.MaxFieldBytes != nil {
-		maxFieldBytes = *req.MaxFieldBytes
-	}
-
 	// Cross-region warning
 	if cfg.Region != "" && claims.Host != "" && claims.Host != cfg.PGHost {
 		slog.WarnContext(ctx, "cross-region query",
@@ -161,17 +221,16 @@ func handleSQL(w http.ResponseWriter, r *http.Request, cfg *Config, pm *poolMana
 		)
 	}
 
-	if err := executeStreaming(ctx, connCfg, &req, claims, cfg, pm, host, port, db, readonly, maxFieldBytes, start, writeLine); err != nil {
-		// Headers already sent; append an error line.
-		writeLine(errorMsg{Error: errorInfo{Message: err.Error()}})
+	if err := executeStreaming(ctx, connCfg, &req, claims, cfg, pm, host, port, db, readonly, opts, start, sw); err != nil {
+		sw.writeLine(errorMsg{Error: errorInfo{Message: err.Error()}})
 	}
 }
 
 type queryKind int
 
 const (
-	queryKindSelect       queryKind = iota // → streamSelect (cursor, bounded memory)
-	queryKindDMLReturning                  // → streamReturning (conn.Query)
+	queryKindSelect       queryKind = iota // → streamSelectWire (cursor, wire-level truncation)
+	queryKindDMLReturning                  // → streamReturningWire (wire-level truncation)
 	queryKindDML                           // → execDML (conn.Exec)
 )
 
@@ -224,37 +283,44 @@ func executeStreaming(
 	port int,
 	db string,
 	readonly bool,
-	maxFieldBytes int,
+	opts queryOptions,
 	start time.Time,
-	writeLine func(interface{}) error,
+	sw *streamWriter,
 ) error {
-	// Acquire a connection: pooled or direct.
-	conn, release, err := acquireConn(ctx, connCfg, pm, host, port, db)
-	if err != nil {
-		dbErrorsTotal.WithLabelValues("connection").Inc()
-		return fmt.Errorf("connection failed: %w", err)
-	}
-	defer release()
+	kind := classifyQuery(req.Query)
 
-	// Apply session settings
-	if err := applySession(ctx, conn, claims, cfg, readonly); err != nil {
-		return err
-	}
+	switch kind {
+	case queryKindSelect, queryKindDMLReturning:
+		conn, err := acquireOwnedConn(ctx, connCfg, pm, host, port, db)
+		if err != nil {
+			dbErrorsTotal.WithLabelValues("connection").Inc()
+			return fmt.Errorf("connection failed: %w", err)
+		}
+		if err := applySession(ctx, conn, claims, cfg, readonly, opts); err != nil {
+			conn.Close(ctx)
+			return err
+		}
+		if kind == queryKindSelect {
+			return streamSelectWire(ctx, conn, req.Query, opts, start, sw)
+		}
+		return streamReturningWire(ctx, conn, req.Query, opts, start, sw)
 
-	switch classifyQuery(req.Query) {
-	case queryKindSelect:
-		return streamSelect(ctx, conn, req.Query, cfg, maxFieldBytes, start, writeLine)
-	case queryKindDMLReturning:
-		// Bug 1 fix: DML with RETURNING must use conn.Query, not conn.Exec,
-		// otherwise returned rows are silently discarded.
-		return streamReturning(ctx, conn, req.Query, cfg, maxFieldBytes, start, writeLine)
 	default:
-		return execDML(ctx, conn, req.Query, start, writeLine)
+		conn, release, err := acquireConn(ctx, connCfg, pm, host, port, db)
+		if err != nil {
+			dbErrorsTotal.WithLabelValues("connection").Inc()
+			return fmt.Errorf("connection failed: %w", err)
+		}
+		defer release()
+		if err := applySession(ctx, conn, claims, cfg, readonly, opts); err != nil {
+			return err
+		}
+		return execDML(ctx, conn, req.Query, start, sw)
 	}
 }
 
-// acquireConn gets a *pgx.Conn either from the pool or via direct connection.
-// Returns the connection and a release function that must be called when done.
+// acquireConn gets a *pgx.Conn from the pool (borrowed) or via direct connection.
+// The release function must be called when done.
 func acquireConn(ctx context.Context, connCfg *pgx.ConnConfig, pm *poolManager, host string, port int, db string) (*pgx.Conn, func(), error) {
 	if pm != nil {
 		pool, err := pm.getPool(ctx, host, port, db)
@@ -268,7 +334,6 @@ func acquireConn(ctx context.Context, connCfg *pgx.ConnConfig, pm *poolManager, 
 		return poolConn.Conn(), func() { poolConn.Release() }, nil
 	}
 
-	// Direct connection (pooling disabled)
 	conn, err := pgx.ConnectConfig(ctx, connCfg)
 	if err != nil {
 		return nil, nil, err
@@ -276,8 +341,31 @@ func acquireConn(ctx context.Context, connCfg *pgx.ConnConfig, pm *poolManager, 
 	return conn, func() { conn.Close(ctx) }, nil
 }
 
-func applySession(ctx context.Context, conn *pgx.Conn, claims *JWTClaims, cfg *Config, readonly bool) error {
+// acquireOwnedConn gets a *pgx.Conn with sole ownership (removed from pool if
+// pooling is enabled). Caller must close the connection when done.
+// This is required for the wire-level path where we hijack the underlying pgconn.
+func acquireOwnedConn(ctx context.Context, connCfg *pgx.ConnConfig, pm *poolManager, host string, port int, db string) (*pgx.Conn, error) {
+	if pm != nil {
+		pool, err := pm.getPool(ctx, host, port, db)
+		if err != nil {
+			return nil, err
+		}
+		poolConn, err := pool.Acquire(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return poolConn.Hijack(), nil
+	}
+
+	return pgx.ConnectConfig(ctx, connCfg)
+}
+
+func applySession(ctx context.Context, conn *pgx.Conn, claims *JWTClaims, cfg *Config, readonly bool, opts queryOptions) error {
 	if _, err := conn.Exec(ctx, "SET idle_in_transaction_session_timeout = '60s'"); err != nil {
+		return err
+	}
+	timeoutMs := strconv.Itoa(int(opts.StatementTimeout.Milliseconds()))
+	if _, err := conn.Exec(ctx, "SET statement_timeout = "+timeoutMs); err != nil {
 		return err
 	}
 	if claims.Role != "" && isValidIdent(claims.Role) {
@@ -298,194 +386,292 @@ func applySession(ctx context.Context, conn *pgx.Conn, claims *JWTClaims, cfg *C
 	return nil
 }
 
-// streamSelect uses DECLARE CURSOR + FETCH for bounded-memory streaming.
-func streamSelect(
+// --- Wire-level streaming (Phase 2) ---
+
+// streamSelectWire uses DECLARE CURSOR + FETCH with wire-level DataRow parsing.
+// Columns exceeding opts.MaxFieldBytes are truncated at the TCP level before they
+// enter any Go buffer. Combined with dynamic batch sizing, this enforces a hard
+// per-query memory ceiling of opts.MaxMemory bytes.
+//
+// The conn is hijacked (caller must NOT close it); cleanup is handled internally.
+func streamSelectWire(
 	ctx context.Context,
 	conn *pgx.Conn,
 	query string,
-	cfg *Config,
-	maxFieldBytes int,
+	opts queryOptions,
 	start time.Time,
-	writeLine func(interface{}) error,
+	sw *streamWriter,
 ) error {
-	batch := cfg.CursorBatchSize
-	if batch <= 0 {
-		batch = 100
-	}
-
+	// Use pgx for transaction + cursor setup.
 	if _, err := conn.Exec(ctx, "BEGIN"); err != nil {
+		conn.Close(ctx)
 		return err
 	}
-	// Bug 2 fix: log cleanup errors rather than silently ignoring them.
-	defer func() {
-		if _, err := conn.Exec(ctx, "ROLLBACK"); err != nil {
-			slog.WarnContext(ctx, "ROLLBACK failed", "error", err)
-		}
-	}()
-
 	cursorSQL := fmt.Sprintf("DECLARE _pgw_cur NO SCROLL CURSOR FOR %s", query)
 	if _, err := conn.Exec(ctx, cursorSQL); err != nil {
+		conn.Exec(ctx, "ROLLBACK")
+		conn.Close(ctx)
 		return err
 	}
 
-	var totalRows int64
-	columnsSent := false
+	// Hijack the connection to get the raw net.Conn for wire-level parsing.
+	hj, err := conn.PgConn().Hijack()
+	if err != nil {
+		// pgconn hijack failed; attempt best-effort cleanup via pgx.
+		conn.Exec(ctx, "CLOSE _pgw_cur")
+		conn.Exec(ctx, "ROLLBACK")
+		conn.Close(ctx)
+		return fmt.Errorf("hijack connection: %w", err)
+	}
+	wc := newWireConn(hj.Conn)
+	defer func() {
+		wc.sendSimpleQuery("CLOSE _pgw_cur")
+		wc.drainUntilReady()
+		wc.sendSimpleQuery("ROLLBACK")
+		wc.drainUntilReady()
+		wc.sendTerminate()
+		wc.Close()
+	}()
+
+	var (
+		fields      []fieldDesc
+		totalRows   int64
+		columnsSent bool
+		rowBuf      bytes.Buffer
+	)
+
+	batchSize := opts.CursorBatchSize
 
 	for {
-		rows, err := conn.Query(ctx, fmt.Sprintf("FETCH %d FROM _pgw_cur", batch))
-		if err != nil {
-			return err
-		}
-
-		if !columnsSent {
-			fds := rows.FieldDescriptions()
-			cols := make([]columnInfo, len(fds))
-			for i, fd := range fds {
-				cols[i] = columnInfo{Name: fd.Name, TypeOID: fd.DataTypeOID}
-			}
-			if err := writeLine(columnMsg{Columns: cols}); err != nil {
-				rows.Close()
-				return err
-			}
-			columnsSent = true
+		fetchSQL := fmt.Sprintf("FETCH %d FROM _pgw_cur", batchSize)
+		if err := wc.sendSimpleQuery(fetchSQL); err != nil {
+			return fmt.Errorf("send FETCH: %w", err)
 		}
 
 		batchCount := 0
-		for rows.Next() {
-			values, err := rows.Values()
+		for {
+			msgType, bodyLen, err := wc.readMsgHeader()
 			if err != nil {
-				rows.Close()
-				return err
+				return fmt.Errorf("read message: %w", err)
 			}
 
-			fds := rows.FieldDescriptions()
-			row := make(map[string]interface{}, len(fds))
-			var truncated []string
-			for i, fd := range fds {
-				val, wasTruncated := truncateValue(values[i], maxFieldBytes)
-				row[fd.Name] = val
-				if wasTruncated {
-					truncated = append(truncated, fd.Name)
+			switch msgType {
+			case pgMsgRowDescription:
+				body, err := wc.readBody(bodyLen)
+				if err != nil {
+					return err
+				}
+				fields, err = parseRowDescription(body)
+				if err != nil {
+					return err
+				}
+				if !columnsSent {
+					cols := make([]columnInfo, len(fields))
+					for i, fd := range fields {
+						cols[i] = columnInfo{Name: fd.Name, TypeOID: fd.DataTypeOID}
+					}
+					if err := sw.writeLine(columnMsg{Columns: cols}); err != nil {
+						return err
+					}
+					columnsSent = true
+					batchSize = computeBatchSize(opts, len(fields))
+				}
+
+			case pgMsgDataRow:
+				columns, err := wc.readDataRowTruncated(bodyLen, opts.MaxFieldBytes)
+				if err != nil {
+					return err
+				}
+				rowBuf.Reset()
+				if err := writeJSONRow(&rowBuf, fields, columns); err != nil {
+					return err
+				}
+				if err := sw.writeRaw(rowBuf.Bytes()); err != nil {
+					return err
+				}
+				batchCount++
+				totalRows++
+				if opts.MaxRows > 0 && totalRows >= int64(opts.MaxRows) {
+					goto done
+				}
+
+			case pgMsgCommandComplete:
+				if _, err := wc.readBody(bodyLen); err != nil {
+					return err
+				}
+
+			case pgMsgReadyForQuery:
+				if _, err := wc.readBody(bodyLen); err != nil {
+					return err
+				}
+				goto batchDone
+
+			case pgMsgErrorResponse:
+				body, err := wc.readBody(bodyLen)
+				if err != nil {
+					return err
+				}
+				ef := parseErrorResponse(body)
+				dbErrorsTotal.WithLabelValues("query").Inc()
+				return fmt.Errorf("%s: %s", ef['C'], ef['M'])
+
+			case pgMsgEmptyQuery:
+				if _, err := wc.readBody(bodyLen); err != nil {
+					return err
+				}
+
+			case pgMsgNoticeResponse:
+				if _, err := wc.readBody(bodyLen); err != nil {
+					return err
+				}
+
+			default:
+				if _, err := wc.readBody(bodyLen); err != nil {
+					return err
 				}
 			}
-
-			if err := writeLine(rowMsg{Row: row, TruncatedFields: truncated}); err != nil {
-				rows.Close()
-				return err // client disconnected
-			}
-			batchCount++
-			totalRows++
-
-			if cfg.MaxRows > 0 && totalRows >= int64(cfg.MaxRows) {
-				rows.Close()
-				goto done
-			}
 		}
-		rows.Close()
-		if rows.Err() != nil {
-			return rows.Err()
-		}
-
-		if batchCount < batch {
-			break // no more rows
+	batchDone:
+		if batchCount < batchSize {
+			break
 		}
 	}
 
 done:
-	// Bug 2 fix: log errors on cleanup; don't return them (response headers already sent).
-	if _, err := conn.Exec(ctx, "CLOSE _pgw_cur"); err != nil {
-		slog.WarnContext(ctx, "CLOSE cursor failed", "error", err)
-	}
-	if _, err := conn.Exec(ctx, "COMMIT"); err != nil {
-		slog.WarnContext(ctx, "COMMIT failed", "error", err)
-	}
-
 	dur := time.Since(start)
 	rowsProcessedTotal.WithLabelValues("SELECT").Add(float64(totalRows))
 	queryDuration.WithLabelValues("SELECT", "ok").Observe(dur.Seconds())
-	return writeLine(completeMsg{Complete: completeInfo{
+	return sw.writeLine(completeMsg{Complete: completeInfo{
 		Command:    "SELECT",
 		RowCount:   totalRows,
 		DurationMs: float64(dur.Microseconds()) / 1000.0,
 	}})
 }
 
-// streamReturning handles DML with RETURNING clauses.
-// DECLARE CURSOR cannot wrap DML, so we use conn.Query directly.
-func streamReturning(
+// streamReturningWire handles DML with RETURNING using wire-level DataRow parsing.
+// DECLARE CURSOR cannot wrap DML, so we send the query directly and read responses.
+//
+// The conn is hijacked (caller must NOT close it); cleanup is handled internally.
+func streamReturningWire(
 	ctx context.Context,
 	conn *pgx.Conn,
 	query string,
-	cfg *Config,
-	maxFieldBytes int,
+	opts queryOptions,
 	start time.Time,
-	writeLine func(interface{}) error,
+	sw *streamWriter,
 ) error {
-	rows, err := conn.Query(ctx, query)
+	// Hijack immediately — we'll send the query ourselves at the wire level.
+	hj, err := conn.PgConn().Hijack()
 	if err != nil {
-		dbErrorsTotal.WithLabelValues("query").Inc()
-		return err
+		conn.Close(ctx)
+		return fmt.Errorf("hijack connection: %w", err)
+	}
+	wc := newWireConn(hj.Conn)
+	defer func() {
+		wc.sendTerminate()
+		wc.Close()
+	}()
+
+	if err := wc.sendSimpleQuery(query); err != nil {
+		return fmt.Errorf("send query: %w", err)
 	}
 
-	// FieldDescriptions are available immediately after Query (from RowDescription).
-	fds := rows.FieldDescriptions()
-	cols := make([]columnInfo, len(fds))
-	for i, fd := range fds {
-		cols[i] = columnInfo{Name: fd.Name, TypeOID: fd.DataTypeOID}
-	}
-	if err := writeLine(columnMsg{Columns: cols}); err != nil {
-		rows.Close()
-		return err
-	}
+	var (
+		fields    []fieldDesc
+		totalRows int64
+		cmdTag    string
+		rowBuf    bytes.Buffer
+	)
 
-	var totalRows int64
-	for rows.Next() {
-		values, err := rows.Values()
+	for {
+		msgType, bodyLen, err := wc.readMsgHeader()
 		if err != nil {
-			rows.Close()
-			return err
+			return fmt.Errorf("read message: %w", err)
 		}
 
-		row := make(map[string]interface{}, len(fds))
-		var truncated []string
-		for i, fd := range fds {
-			val, wasTruncated := truncateValue(values[i], maxFieldBytes)
-			row[fd.Name] = val
-			if wasTruncated {
-				truncated = append(truncated, fd.Name)
+		switch msgType {
+		case pgMsgRowDescription:
+			body, err := wc.readBody(bodyLen)
+			if err != nil {
+				return err
+			}
+			fields, err = parseRowDescription(body)
+			if err != nil {
+				return err
+			}
+			cols := make([]columnInfo, len(fields))
+			for i, fd := range fields {
+				cols[i] = columnInfo{Name: fd.Name, TypeOID: fd.DataTypeOID}
+			}
+			if err := sw.writeLine(columnMsg{Columns: cols}); err != nil {
+				return err
+			}
+
+		case pgMsgDataRow:
+			columns, err := wc.readDataRowTruncated(bodyLen, opts.MaxFieldBytes)
+			if err != nil {
+				return err
+			}
+			rowBuf.Reset()
+			if err := writeJSONRow(&rowBuf, fields, columns); err != nil {
+				return err
+			}
+			if err := sw.writeRaw(rowBuf.Bytes()); err != nil {
+				return err
+			}
+			totalRows++
+
+		case pgMsgCommandComplete:
+			body, err := wc.readBody(bodyLen)
+			if err != nil {
+				return err
+			}
+			cmdTag = parseCommandComplete(body)
+
+		case pgMsgReadyForQuery:
+			if _, err := wc.readBody(bodyLen); err != nil {
+				return err
+			}
+			goto done
+
+		case pgMsgErrorResponse:
+			body, err := wc.readBody(bodyLen)
+			if err != nil {
+				return err
+			}
+			ef := parseErrorResponse(body)
+			dbErrorsTotal.WithLabelValues("query").Inc()
+			return fmt.Errorf("%s: %s", ef['C'], ef['M'])
+
+		default:
+			if _, err := wc.readBody(bodyLen); err != nil {
+				return err
 			}
 		}
-
-		if err := writeLine(rowMsg{Row: row, TruncatedFields: truncated}); err != nil {
-			rows.Close()
-			return err
-		}
-		totalRows++
-	}
-	rows.Close()
-	if rows.Err() != nil {
-		dbErrorsTotal.WithLabelValues("query").Inc()
-		return rows.Err()
 	}
 
-	cmd := rows.CommandTag().String()
+done:
+	if cmdTag == "" {
+		cmdTag = "UNKNOWN"
+	}
 	dur := time.Since(start)
-	rowsProcessedTotal.WithLabelValues(cmd).Add(float64(totalRows))
-	queryDuration.WithLabelValues(cmd, "ok").Observe(dur.Seconds())
-	return writeLine(completeMsg{Complete: completeInfo{
-		Command:    cmd,
+	rowsProcessedTotal.WithLabelValues(cmdTag).Add(float64(totalRows))
+	queryDuration.WithLabelValues(cmdTag, "ok").Observe(dur.Seconds())
+	return sw.writeLine(completeMsg{Complete: completeInfo{
+		Command:    cmdTag,
 		RowCount:   totalRows,
 		DurationMs: float64(dur.Microseconds()) / 1000.0,
 	}})
 }
 
 // execDML handles INSERT, UPDATE, DELETE, CREATE, etc. (without RETURNING).
+// No wire-level parsing needed since there are no DataRow messages.
 func execDML(
 	ctx context.Context,
 	conn *pgx.Conn,
 	query string,
 	start time.Time,
-	writeLine func(interface{}) error,
+	sw *streamWriter,
 ) error {
 	tag, err := conn.Exec(ctx, query)
 	if err != nil {
@@ -497,12 +683,11 @@ func execDML(
 	cmd := tag.String()
 	queryDuration.WithLabelValues(cmd, "ok").Observe(dur.Seconds())
 
-	// Empty columns for consistency
-	if err := writeLine(columnMsg{Columns: []columnInfo{}}); err != nil {
+	if err := sw.writeLine(columnMsg{Columns: []columnInfo{}}); err != nil {
 		return err
 	}
 
-	return writeLine(completeMsg{Complete: completeInfo{
+	return sw.writeLine(completeMsg{Complete: completeInfo{
 		Command:    cmd,
 		RowCount:   tag.RowsAffected(),
 		DurationMs: float64(dur.Microseconds()) / 1000.0,
@@ -511,10 +696,7 @@ func execDML(
 
 // --- Helpers ---
 
-// newPGConnConfig builds a pgx.ConnConfig without constructing a URL, which
-// avoids URL-encoding issues with passwords that contain special characters like %.
 func newPGConnConfig(cfg *Config, host string, port int, db string) (*pgx.ConnConfig, error) {
-	// Use libpq key=value DSN for non-sensitive fields; set password directly on the struct.
 	dsn := fmt.Sprintf(
 		"host=%s port=%d user=%s dbname=%s sslmode=prefer statement_timeout=%s",
 		host, port, cfg.PGUser, db,
@@ -524,14 +706,12 @@ func newPGConnConfig(cfg *Config, host string, port int, db string) (*pgx.ConnCo
 	if err != nil {
 		return nil, fmt.Errorf("pgx config: %w", err)
 	}
-	// Bug 4 fix: set password directly to avoid any URL-encoding issues.
 	connCfg.Password = cfg.PGPassword
 	return connCfg, nil
 }
 
 func isSelectLike(upper string) bool {
 	for strings.HasPrefix(upper, "WITH ") || strings.HasPrefix(upper, "(") {
-		// skip CTEs and subquery wrappers
 		idx := strings.Index(upper, "SELECT")
 		if idx < 0 {
 			return false
@@ -545,7 +725,6 @@ func isSelectLike(upper string) bool {
 		strings.HasPrefix(upper, "EXPLAIN")
 }
 
-// hasDMLReturning returns true for INSERT/UPDATE/DELETE queries that contain RETURNING.
 func hasDMLReturning(upper string) bool {
 	return strings.Contains(upper, " RETURNING") &&
 		(strings.HasPrefix(upper, "INSERT") ||
@@ -560,31 +739,6 @@ func isValidIdent(s string) bool {
 		}
 	}
 	return len(s) > 0
-}
-
-// truncateValue truncates large byte slices and strings to maxBytes.
-// Other types pass through unchanged. This is the key to bounded memory:
-// pgx already materialized the value, but we cap what we serialize to JSON.
-// Returns the (possibly truncated) value and a bool indicating truncation occurred.
-func truncateValue(v interface{}, maxBytes int) (interface{}, bool) {
-	if maxBytes <= 0 {
-		return v, false // no limit
-	}
-	switch val := v.(type) {
-	case []byte:
-		if len(val) > maxBytes {
-			truncatedFieldsTotal.Inc()
-			return fmt.Sprintf("[truncated: %d bytes, showing first %d]%s",
-				len(val), maxBytes, string(val[:maxBytes])), true
-		}
-	case string:
-		if len(val) > maxBytes {
-			truncatedFieldsTotal.Inc()
-			return fmt.Sprintf("[truncated: %d bytes, showing first %d]%s",
-				len(val), maxBytes, val[:maxBytes]), true
-		}
-	}
-	return v, false
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -606,3 +760,18 @@ func addCORS(w http.ResponseWriter, r *http.Request, cfg *Config) {
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	w.Header().Set("Access-Control-Max-Age", "86400")
 }
+
+// Future: COPY-based true streaming for O(buffer_size) memory on /sql.
+//
+// For SELECT queries that need untruncated large fields (100MB+), the wire-level
+// approach above still materializes up to max_field_bytes per column. To achieve
+// O(32KB) memory regardless of column size, a future Phase 3 could use:
+//
+//   conn.PgConn().CopyTo(ctx, httpResponseWriter,
+//       `COPY (SELECT row_to_json(t) FROM (`+query+`) t) TO STDOUT CSV QUOTE e'\x01'`)
+//
+// PostgreSQL does JSON serialization server-side; Go becomes a pure byte pipe.
+// Limitations: SELECT only (not DML+RETURNING), no $1 params, PG's row_to_json format.
+//
+// Until then, use the WebSocket relay (/v1) for truly unlimited streaming — it
+// forwards raw PG wire protocol over TCP with O(32KB) memory.
